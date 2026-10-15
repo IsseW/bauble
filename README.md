@@ -81,6 +81,8 @@ human = Creature {
 }
 ```
 
+Where the expected type is a struct with named fields, the type name of a struct value can be left out. With `struct Stats { health: u32, speed: f32 }` as the type of the field `stats`, `stats: { health: 10, speed: 1.5 }` reads as `stats: Stats { health: 10, speed: 1.5 }`. This also holds inside lists, `Some(...)` and the fields of an enum variant. An enum variant itself is always written out.
+
 Using attributes can be useful to add extra information to objects. Which can be accessed by the `FromBauble` macro. And can be fields in the struct, or define some meta data used while parsing.
 ```rust
 use ui::{Button, Node}
