@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 
+use indexmap::IndexMap;
+
 use crate::{
     ConversionError, FieldsKind, PrimitiveValue, Span,
-    parse::ParseVal,
+    parse::{ParseVal, PathEnd},
     path::{TypePath, TypePathElem},
     spanned::{SpanExt, Spanned},
     types::{self, TypeId, TypeRegistry},
@@ -478,6 +480,10 @@ where
 
     fn get_asset(ident: &Self::Ref, symbols: &Symbols) -> Result<ObjectPath>;
 
+    fn map_key_as_field(_key: &Self::Inner) -> Option<Ident> {
+        None
+    }
+
     fn convert_inner<'a, C: ConvertValue>(
         value: Spanned<&Value<Self>>,
         attributes: Spanned<&Attributes<Self::Inner>>,
@@ -549,6 +555,41 @@ where
                 }
 
                 seq
+            }};
+        }
+
+        macro_rules! parse_named {
+            ($fields:expr, $values:expr, |$key:ident| $to_ident:expr $(,)?) => {{
+                let fields = $fields;
+                let values = $values;
+
+                for (field, _) in fields.required.iter() {
+                    if !values.contains_key(field.as_str()) {
+                        Err(ConversionError::MissingField {
+                            attribute: false,
+                            field: field.clone(),
+                            ty: *ty_id,
+                        }
+                        .spanned(span))?
+                    }
+                }
+
+                let mut new_fields = Fields::with_capacity(values.len());
+                for ($key, value) in values {
+                    let field = $to_ident;
+                    let Some(ty) = fields.get(field.as_str()) else {
+                        Err(ConversionError::UnexpectedField {
+                            attribute: false,
+                            field: field.clone(),
+                            ty: *ty_id,
+                        }
+                        .spanned(span))?
+                    };
+
+                    new_fields.insert(field, value.convert(meta.reborrow(), ty.id, no_attr())?);
+                }
+
+                new_fields
             }};
         }
 
@@ -902,37 +943,28 @@ where
                         FieldsKind::Unnamed(parse_unnamed!(fields, values))
                     }
                     (types::Fields::Named(fields), FieldsKind::Named(value_fields)) => {
-                        for (field, _) in fields.required.iter() {
-                            if !value_fields.contains_key(field.as_str()) {
-                                Err(ConversionError::MissingField {
-                                    attribute: false,
-                                    field: field.clone(),
-                                    ty: *ty_id,
-                                }
-                                .spanned(span))?
-                            }
-                        }
-
-                        let mut new_fields = Fields::with_capacity(value_fields.len());
-                        for (field, value) in value_fields {
-                            let field = Self::get_spanned_field(field, &meta);
-                            let Some(ty) = fields.get(field.as_str()) else {
-                                Err(ConversionError::UnexpectedField {
-                                    attribute: false,
-                                    field: field.clone(),
-                                    ty: *ty_id,
-                                }
-                                .spanned(span))?
-                            };
-
-                            new_fields
-                                .insert(field, value.convert(meta.reborrow(), ty.id, no_attr())?);
-                        }
-
-                        FieldsKind::Named(new_fields)
+                        FieldsKind::Named(parse_named!(fields, value_fields, |field| {
+                            Self::get_spanned_field(field, &meta)
+                        }))
                     }
                     _ => Err(ConversionError::WrongFields { ty: *ty_id }.spanned(span))?,
                 }),
+                (types::TypeKind::Struct(types::Fields::Named(fields)), Value::Map(map))
+                    if map
+                        .iter()
+                        .all(|(key, _)| Self::map_key_as_field(key).is_some()) =>
+                {
+                    let value_fields = map
+                        .iter()
+                        .filter_map(|(key, value)| Some((Self::map_key_as_field(key)?, value)))
+                        .collect::<IndexMap<_, _>>();
+
+                    Value::Struct(FieldsKind::Named(parse_named!(
+                        fields,
+                        &value_fields,
+                        |field| field.clone()
+                    )))
+                }
                 (types::TypeKind::Enum { variants }, _) => {
                     // First see if we already have the correct value.
                     let (variant, inner) = if let Value::Enum(variant, value) = &value.value
@@ -1377,6 +1409,24 @@ impl ConvertValueInner for ParseVal {
 
     fn variant_span(variant: &Self::Variant, _meta: &ConvertMeta) -> Span {
         variant.span()
+    }
+
+    fn map_key_as_field(key: &Self::Inner) -> Option<Ident> {
+        let (Some(path), Value::Struct(FieldsKind::Unit)) = (&key.ty, &key.value.value) else {
+            return None;
+        };
+        if !key.attributes.is_empty() {
+            return None;
+        }
+
+        let PathEnd::Ident(last) = &path.last.value else {
+            return None;
+        };
+        match path.leading.as_slice() {
+            [] => Some(last.clone()),
+            [first] => Some(format!("{}::{}", first.value, last.value).spanned(path.span())),
+            _ => None,
+        }
     }
 }
 
